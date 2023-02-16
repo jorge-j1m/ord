@@ -82,6 +82,7 @@ impl Preview {
             satpoint: None,
             dry_run: false,
             no_limit: false,
+            destination: None,
           },
         )),
       }

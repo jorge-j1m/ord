@@ -1,4 +1,10 @@
-use {self::inscription_updater::InscriptionUpdater, super::*, std::sync::mpsc};
+use {
+  self::inscription_updater::InscriptionUpdater,
+  super::{tx_fetcher::TxFetcher, *},
+  futures::future::try_join_all,
+  std::sync::mpsc,
+  tokio::sync::mpsc::{error::TryRecvError, Receiver, Sender},
+};
 
 mod inscription_updater;
 
@@ -28,6 +34,7 @@ pub(crate) struct Updater {
   height: u64,
   index_sats: bool,
   sat_ranges_since_flush: u64,
+  options: Options,
   outputs_cached: u64,
   outputs_inserted_since_flush: u64,
   outputs_traversed: u64,
@@ -60,6 +67,7 @@ impl Updater {
       height,
       index_sats: index.has_sat_index()?,
       sat_ranges_since_flush: 0,
+      options: index.options.clone(),
       outputs_cached: 0,
       outputs_inserted_since_flush: 0,
       outputs_traversed: 0,
@@ -90,7 +98,9 @@ impl Updater {
       Some(progress_bar)
     };
 
-    let rx = Self::fetch_blocks_from(index, self.height, self.index_sats)?;
+    let rx = Self::fetch_blocks_from(index, self.height, self.index_sats, self.options.clone())?;
+
+    let (mut outpoint_sender, mut value_receiver) = Self::spawn_tx_fetcher(index)?;
 
     let mut uncommitted = 0;
     let mut value_cache = HashMap::new();
@@ -100,7 +110,14 @@ impl Updater {
         Err(mpsc::RecvError) => break,
       };
 
-      self.index_block(index, &mut wtx, block, &mut value_cache)?;
+      self.index_block(
+        index,
+        &mut outpoint_sender,
+        &mut value_receiver,
+        &mut wtx,
+        block,
+        &mut value_cache,
+      )?;
 
       if let Some(progress_bar) = &mut progress_bar {
         progress_bar.inc(1);
@@ -160,16 +177,15 @@ impl Updater {
     index: &Index,
     mut height: u64,
     index_sats: bool,
+    options: Options,
   ) -> Result<mpsc::Receiver<BlockData>> {
     let (tx, rx) = mpsc::sync_channel(32);
 
     let height_limit = index.height_limit;
 
-    let client =
-      Client::new(&index.rpc_url, index.auth.clone()).context("failed to connect to RPC URL")?;
+    let client = options.bitcoin_rpc_client()?;
 
-    // NB: We temporarily always fetch transactions, to avoid expensive cache misses.
-    let first_inscription_height = index.first_inscription_height.min(0);
+    let first_inscription_height = index.first_inscription_height;
 
     thread::spawn(move || loop {
       if let Some(height_limit) = height_limit {
@@ -243,13 +259,101 @@ impl Updater {
     }
   }
 
+  fn spawn_tx_fetcher(index: &Index) -> Result<(Sender<OutPoint>, Receiver<u64>)> {
+    let tx_fetcher = TxFetcher::new(&index.rpc_url)?;
+
+    const CHANNEL_BUFFER_SIZE: usize = 20_000;
+    let (outpoint_sender, mut outpoint_receiver) =
+      tokio::sync::mpsc::channel::<OutPoint>(CHANNEL_BUFFER_SIZE);
+    let (value_sender, value_receiver) = tokio::sync::mpsc::channel::<u64>(CHANNEL_BUFFER_SIZE);
+
+    const BATCH_SIZE: usize = 2048;
+    const PARALLEL_REQUESTS: usize = 12;
+
+    std::thread::spawn(move || {
+      let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+      rt.block_on(async move {
+        loop {
+          let Some(outpoint) = outpoint_receiver.recv().await else {
+            log::info!("Outpoint channel closed");
+            return;
+          };
+          let mut outpoints = vec![outpoint];
+          for _ in 0..BATCH_SIZE-1 {
+            let Ok(outpoint) = outpoint_receiver.try_recv() else {
+              break;
+            };
+            outpoints.push(outpoint);
+          }
+          let parts = (outpoints.len() / PARALLEL_REQUESTS) + 1;
+          let mut futs = Vec::with_capacity(PARALLEL_REQUESTS);
+          for chunk in outpoints.chunks(parts) {
+            let txids = chunk.iter().map(|outpoint| outpoint.txid).collect();
+            let fut = tx_fetcher.get_transactions(txids);
+            futs.push(fut);
+          }
+          let txs = match try_join_all(futs).await {
+            Ok(txs) => txs,
+            Err(e) => {
+              log::warn!("Couldn't receive txs {e}");
+              return;
+            }
+          };
+          for (i, tx) in txs.iter().flatten().enumerate() {
+            let Ok(_) = value_sender.send(tx.output[usize::try_from(outpoints[i].vout).unwrap()].value).await else {
+              log::warn!("Value channel closed unexpectedly");
+              return;
+            };
+          }
+        }
+      })
+    });
+
+    Ok((outpoint_sender, value_receiver))
+  }
+
   fn index_block(
     &mut self,
     index: &Index,
+    outpoint_sender: &mut Sender<OutPoint>,
+    value_receiver: &mut Receiver<u64>,
     wtx: &mut WriteTransaction,
     block: BlockData,
     value_cache: &mut HashMap<OutPoint, u64>,
   ) -> Result<()> {
+    let Err(TryRecvError::Empty) = value_receiver.try_recv() else { return Err(anyhow!("Previous block did not consume all input values")); };
+
+    let mut outpoint_to_value = wtx.open_table(OUTPOINT_TO_VALUE)?;
+
+    if !self.index_sats {
+      let txids = block
+        .txdata
+        .iter()
+        .map(|(_, txid)| txid)
+        .collect::<HashSet<_>>();
+      for (tx, _) in &block.txdata {
+        for input in &tx.input {
+          let prev_output = input.previous_output;
+          if prev_output.is_null() {
+            continue;
+          }
+          if txids.contains(&prev_output.txid) {
+            continue;
+          }
+          if value_cache.contains_key(&prev_output) {
+            continue;
+          }
+          if outpoint_to_value.get(&prev_output.store())?.is_some() {
+            continue;
+          }
+          outpoint_sender.blocking_send(prev_output)?;
+        }
+      }
+    }
+
     let mut height_to_block_hash = wtx.open_table(HEIGHT_TO_BLOCK_HASH)?;
 
     let start = Instant::now();
@@ -279,7 +383,6 @@ impl Updater {
     let mut inscription_id_to_satpoint = wtx.open_table(INSCRIPTION_ID_TO_SATPOINT)?;
     let mut inscription_number_to_inscription_id =
       wtx.open_table(INSCRIPTION_NUMBER_TO_INSCRIPTION_ID)?;
-    let mut outpoint_to_value = wtx.open_table(OUTPOINT_TO_VALUE)?;
     let mut sat_to_inscription_id = wtx.open_table(SAT_TO_INSCRIPTION_ID)?;
     let mut satpoint_to_inscription_id = wtx.open_table(SATPOINT_TO_INSCRIPTION_ID)?;
     let mut statistic_to_count = wtx.open_table(STATISTIC_TO_COUNT)?;
@@ -292,7 +395,7 @@ impl Updater {
     let mut inscription_updater = InscriptionUpdater::new(
       self.height,
       &mut inscription_id_to_satpoint,
-      index,
+      value_receiver,
       &mut inscription_id_to_inscription_entry,
       lost_sats,
       &mut inscription_number_to_inscription_id,
