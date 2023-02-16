@@ -1,7 +1,6 @@
 use {
   anyhow::{anyhow, Result},
   bitcoin::{consensus::deserialize, Transaction, Txid},
-  bitcoincore_rpc::Auth,
   hyper::{client::HttpConnector, Body, Client, Method, Request},
   serde::Deserialize,
 };
@@ -26,11 +25,7 @@ struct JsonError {
 }
 
 impl TxFetcher {
-  pub(crate) fn new(url: &str, auth: Auth) -> Result<Self> {
-    if auth == Auth::None {
-      return Err(anyhow!("No authentication provided"));
-    }
-
+  pub(crate) fn new(url: &str) -> Result<Self> {
     let client = Client::new();
 
     let url = if url.starts_with("http://") {
@@ -39,8 +34,7 @@ impl TxFetcher {
       "http://".to_string() + url
     };
 
-    let (user, password) = auth.get_user_pass()?;
-    let auth = format!("{}:{}", user.unwrap(), password.unwrap());
+    let auth = format!("user:password");
     let auth = format!("Basic {}", &base64::encode(auth));
     Ok(TxFetcher { client, url, auth })
   }

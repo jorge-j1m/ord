@@ -260,7 +260,7 @@ impl Updater {
   }
 
   fn spawn_tx_fetcher(index: &Index) -> Result<(Sender<OutPoint>, Receiver<u64>)> {
-    let tx_fetcher = TxFetcher::new(&index.rpc_url, index.auth.clone())?;
+    let tx_fetcher = TxFetcher::new(&index.rpc_url)?;
 
     const CHANNEL_BUFFER_SIZE: usize = 20_000;
     let (outpoint_sender, mut outpoint_receiver) =
