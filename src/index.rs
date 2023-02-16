@@ -53,6 +53,7 @@ pub(crate) struct Index {
   height_limit: Option<u64>,
   options: Options,
   reorged: AtomicBool,
+  rpc_url: String
 }
 
 #[derive(Debug, PartialEq)]
@@ -229,6 +230,7 @@ impl Index {
       height_limit: options.height_limit,
       reorged: AtomicBool::new(false),
       options: options.clone(),
+      rpc_url: options.rpc_url(),
     })
   }
 
